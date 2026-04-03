@@ -234,6 +234,36 @@ scuda/
 
 **FatBinary Caching**: Each `__cudaRegisterFatBinary` call transfers megabytes of kernel binary. SCUDA hashes the data and caches it — on repeat imports, only a 16-byte hash is sent instead of the full binary, and the server reuses its previously-registered handle. Client cache is stored at `~/.scuda/cache/`.
 
+## Why RPC? Design Trade-offs
+
+SCUDA uses a synchronous RPC (Remote Procedure Call) model: each CUDA API call becomes a network request-response. This is the simplest mapping — `cudaMalloc(size)` on the client becomes an RPC that the server executes on the real GPU and returns the result.
+
+### The problem with per-call RPC
+
+We experienced this firsthand: `import torch` generates ~10,000 kernel registration calls. With per-call RPC, each one is a network round-trip (~0.1ms on LAN). That's 10,000 × 0.1ms = **minutes of pure latency**, not computation.
+
+```
+Per-call RPC (naive):
+  registerVar → wait → registerVar → wait → ... × 10,000  = slow
+
+Batched (current):
+  [registerVar × 35] → send batch → wait once              = 18x faster
+
+Cached (current):
+  hash check → hit → skip entirely                         = ~instant
+```
+
+### Better architectures (future directions)
+
+| Approach | Idea | Benefit |
+|----------|------|---------|
+| **Command queue** | Accumulate calls, submit as a batch, get all results at once (like Vulkan/Metal) | Amortize round-trip cost across many calls |
+| **One-way streaming** | Fire-and-forget for void calls (registrations, H2D memcpy), only sync when a return value is needed | 10,000 registrations in 1 round-trip |
+| **RDMA** | Bypass TCP/IP, directly read/write remote GPU memory (InfiniBand/RoCE) | Latency from ~100μs to ~1μs |
+| **Shared memory** | For same-machine VM/container scenarios, zero-copy via shared memory pages | Near-native performance |
+
+Our batch registration and FatBinary caching are essentially retrofitting command-queue semantics onto the RPC framework. A ground-up redesign as an async command queue with selective synchronization would be the ideal long-term architecture.
+
 ## Troubleshooting
 
 ### `nvidia-smi` shows "ERR!" for temperature or "Function Not Found" for memory
