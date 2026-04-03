@@ -13,6 +13,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "cuda_batch.h"
 #include "gen_api.h"
 
 #include "gen_server.h"
@@ -330,6 +331,284 @@ ERROR_0:
 std::unordered_map<void **, __cudaFatCudaBinary2 *> fat_binary_map;
 
 extern "C" void **__cudaRegisterFatBinary(void *fatCubin);
+extern "C" void __cudaRegisterFunction(void **fatCubinHandle,
+                                       const char *hostFun, char *deviceFun,
+                                       const char *deviceName, int thread_limit,
+                                       uint3 *tid, uint3 *bid, dim3 *bDim,
+                                       dim3 *gDim, int *wSize);
+extern "C" void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
+                                  char *deviceAddress, const char *deviceName,
+                                  int ext, size_t size, int constant, int global);
+extern "C" void __cudaRegisterFatBinaryEnd(void **fatCubinHandle);
+
+// ---------------------------------------------------------------------------
+// Batch registration handler
+// Processes RPC_BATCH_CUDA_REGISTER: reads a serialized bundle of
+// FatBinary/Function/Var/FatBinaryEnd commands and executes them all.
+// Wire format (written by cuda_batch_flush on the client):
+//   [cmd_count : uint32_t]
+//   For each command:
+//     [sub_op : uint8_t]
+//     [arg_size : uint32_t]
+//     [arg_data : arg_size bytes]
+// Response:
+//   [num_fat_binaries : uint32_t]
+//   [handle : void**] * num_fat_binaries
+// ---------------------------------------------------------------------------
+int handle_batch_cuda_register(conn_t *conn) {
+  // The caller (server.cpp) already consumed the opcode via rpc_dispatch.
+  // We just need to rpc_read the payload.
+
+  uint32_t cmd_count = 0;
+  if (rpc_read(conn, &cmd_count, sizeof(uint32_t)) < 0) {
+    fprintf(stderr, "[batch_server] failed to read cmd_count\n");
+    return -1;
+  }
+
+  // Map from fake handle (0xFAFB0000 | index) → real server handle
+  // We use a simple vector indexed by fat binary order.
+  std::vector<void **> fat_binary_handles; // real handles in registration order
+
+  for (uint32_t i = 0; i < cmd_count; i++) {
+    uint8_t sub_op = 0;
+    uint32_t arg_size = 0;
+
+    if (rpc_read(conn, &sub_op, sizeof(uint8_t)) < 0 ||
+        rpc_read(conn, &arg_size, sizeof(uint32_t)) < 0) {
+      fprintf(stderr, "[batch_server] failed to read header for cmd %u\n", i);
+      return -1;
+    }
+
+    uint8_t *arg_data = (uint8_t *)malloc(arg_size);
+    if (!arg_data) {
+      fprintf(stderr, "[batch_server] malloc failed for cmd %u (size=%u)\n",
+              i, arg_size);
+      return -1;
+    }
+
+    if (rpc_read(conn, arg_data, arg_size) < 0) {
+      fprintf(stderr, "[batch_server] failed to read arg_data for cmd %u\n", i);
+      free(arg_data);
+      return -1;
+    }
+
+    switch (sub_op) {
+      case CUDA_BATCH_FAT_BINARY: {
+        // Layout: [binary_struct][size:uint64][header_data]
+        if (arg_size < sizeof(__cudaFatCudaBinary2) + sizeof(unsigned long long)) {
+          fprintf(stderr, "[batch_server] FAT_BINARY cmd too small\n");
+          free(arg_data);
+          return -1;
+        }
+        __cudaFatCudaBinary2 *fatCubin =
+            (__cudaFatCudaBinary2 *)malloc(sizeof(__cudaFatCudaBinary2));
+        memcpy(fatCubin, arg_data, sizeof(__cudaFatCudaBinary2));
+
+        uint8_t *ptr = arg_data + sizeof(__cudaFatCudaBinary2);
+        unsigned long long hdr_size;
+        memcpy(&hdr_size, ptr, sizeof(unsigned long long));
+        ptr += sizeof(unsigned long long);
+
+        void *cubin = malloc(hdr_size);
+        memcpy(cubin, ptr, hdr_size);
+        fatCubin->text = (uint64_t)cubin;
+
+        void **real_handle = __cudaRegisterFatBinary(fatCubin);
+        fat_binary_map[real_handle] = fatCubin;
+        fat_binary_handles.push_back(real_handle);
+        break;
+      }
+
+      case CUDA_BATCH_FUNCTION: {
+        // Layout mirrors client serialization:
+        //   [fatCubinHandle : void**]
+        //   [hostFun : void*]
+        //   [deviceFunLen : size_t] [deviceFun]
+        //   [deviceNameLen : size_t] [deviceName]
+        //   [thread_limit : int]
+        //   [mask : uint8_t]
+        //   optional: tid, bid, bDim, gDim, wSize
+        uint8_t *ptr = arg_data;
+
+        void **fake_handle;
+        memcpy(&fake_handle, ptr, sizeof(void **));
+        ptr += sizeof(void **);
+
+        void *hostFun_ptr;
+        memcpy(&hostFun_ptr, ptr, sizeof(void *));
+        ptr += sizeof(void *);
+
+        size_t deviceFunLen;
+        memcpy(&deviceFunLen, ptr, sizeof(size_t));
+        ptr += sizeof(size_t);
+        char *deviceFun = (char *)malloc(deviceFunLen);
+        memcpy(deviceFun, ptr, deviceFunLen);
+        ptr += deviceFunLen;
+
+        size_t deviceNameLen;
+        memcpy(&deviceNameLen, ptr, sizeof(size_t));
+        ptr += sizeof(size_t);
+        char *deviceName = (char *)malloc(deviceNameLen);
+        memcpy(deviceName, ptr, deviceNameLen);
+        ptr += deviceNameLen;
+
+        int thread_limit;
+        memcpy(&thread_limit, ptr, sizeof(int));
+        ptr += sizeof(int);
+
+        uint8_t mask;
+        memcpy(&mask, ptr, sizeof(uint8_t));
+        ptr += sizeof(uint8_t);
+
+        uint3 tid = {}, bid = {};
+        dim3 bDim = {}, gDim = {};
+        int wSize = 0;
+        if (mask & (1 << 0)) { memcpy(&tid,   ptr, sizeof(uint3)); ptr += sizeof(uint3); }
+        if (mask & (1 << 1)) { memcpy(&bid,   ptr, sizeof(uint3)); ptr += sizeof(uint3); }
+        if (mask & (1 << 2)) { memcpy(&bDim,  ptr, sizeof(dim3));  ptr += sizeof(dim3);  }
+        if (mask & (1 << 3)) { memcpy(&gDim,  ptr, sizeof(dim3));  ptr += sizeof(dim3);  }
+        if (mask & (1 << 4)) { memcpy(&wSize, ptr, sizeof(int));   ptr += sizeof(int);   }
+
+        // Translate fake handle to real handle
+        uintptr_t fake_val = (uintptr_t)fake_handle;
+        void **real_handle = nullptr;
+        if ((fake_val & 0xFFFF0000u) == 0xFAFB0000u) {
+          uint32_t idx = (uint32_t)(fake_val & 0x0000FFFFu);
+          if (idx < fat_binary_handles.size())
+            real_handle = fat_binary_handles[idx];
+        } else {
+          real_handle = fake_handle; // shouldn't happen, use as-is
+        }
+
+        __cudaRegisterFunction(
+            real_handle, (const char *)hostFun_ptr, deviceFun, deviceName,
+            thread_limit,
+            (mask & (1 << 0)) ? &tid   : nullptr,
+            (mask & (1 << 1)) ? &bid   : nullptr,
+            (mask & (1 << 2)) ? &bDim  : nullptr,
+            (mask & (1 << 3)) ? &gDim  : nullptr,
+            (mask & (1 << 4)) ? &wSize : nullptr);
+        // Note: deviceFun and deviceName may be held by the CUDA runtime.
+        // We leak them intentionally rather than double-freeing.
+        break;
+      }
+
+      case CUDA_BATCH_VAR: {
+        // Layout mirrors client serialization:
+        //   [fatCubinHandle : void*]
+        //   [hostVarLen : size_t] [hostVar]
+        //   [deviceAddressLen : size_t] [deviceAddress]
+        //   [deviceNameLen : size_t] [deviceName]
+        //   [ext : int] [size : size_t] [constant : int] [global : int]
+        uint8_t *ptr = arg_data;
+
+        void *fake_handle_raw;
+        memcpy(&fake_handle_raw, ptr, sizeof(void *));
+        ptr += sizeof(void *);
+
+        size_t hostVarLen;
+        memcpy(&hostVarLen, ptr, sizeof(size_t));
+        ptr += sizeof(size_t);
+        char *hostVar = (char *)malloc(hostVarLen);
+        memcpy(hostVar, ptr, hostVarLen);
+        ptr += hostVarLen;
+
+        size_t deviceAddressLen;
+        memcpy(&deviceAddressLen, ptr, sizeof(size_t));
+        ptr += sizeof(size_t);
+        char *deviceAddress = (char *)malloc(deviceAddressLen);
+        memcpy(deviceAddress, ptr, deviceAddressLen);
+        ptr += deviceAddressLen;
+
+        size_t deviceNameLen;
+        memcpy(&deviceNameLen, ptr, sizeof(size_t));
+        ptr += sizeof(size_t);
+        char *deviceName = (char *)malloc(deviceNameLen);
+        memcpy(deviceName, ptr, deviceNameLen);
+        ptr += deviceNameLen;
+
+        int ext;
+        memcpy(&ext, ptr, sizeof(int));
+        ptr += sizeof(int);
+        size_t var_size;
+        memcpy(&var_size, ptr, sizeof(size_t));
+        ptr += sizeof(size_t);
+        int constant;
+        memcpy(&constant, ptr, sizeof(int));
+        ptr += sizeof(int);
+        int global;
+        memcpy(&global, ptr, sizeof(int));
+        ptr += sizeof(int);
+
+        // Translate fake handle to real handle
+        uintptr_t fake_val = (uintptr_t)fake_handle_raw;
+        void **real_handle = nullptr;
+        if ((fake_val & 0xFFFF0000u) == 0xFAFB0000u) {
+          uint32_t idx = (uint32_t)(fake_val & 0x0000FFFFu);
+          if (idx < fat_binary_handles.size())
+            real_handle = fat_binary_handles[idx];
+        } else {
+          real_handle = (void **)fake_handle_raw;
+        }
+
+        __cudaRegisterVar(real_handle, hostVar, deviceAddress, deviceName,
+                          ext, var_size, constant, global);
+        // Leak hostVar, deviceAddress, deviceName — CUDA runtime may hold refs
+        break;
+      }
+
+      case CUDA_BATCH_FAT_BINARY_END: {
+        void **fake_handle;
+        memcpy(&fake_handle, arg_data, sizeof(void **));
+
+        uintptr_t fake_val = (uintptr_t)fake_handle;
+        void **real_handle = nullptr;
+        if ((fake_val & 0xFFFF0000u) == 0xFAFB0000u) {
+          uint32_t idx = (uint32_t)(fake_val & 0x0000FFFFu);
+          if (idx < fat_binary_handles.size())
+            real_handle = fat_binary_handles[idx];
+        } else {
+          real_handle = fake_handle;
+        }
+        if (real_handle)
+          __cudaRegisterFatBinaryEnd(real_handle);
+        break;
+      }
+
+      default:
+        fprintf(stderr, "[batch_server] unknown sub_op=%u for cmd %u\n",
+                (unsigned)sub_op, i);
+        break;
+    }
+
+    free(arg_data);
+  }
+
+  // End of request data
+  int request_id = rpc_read_end(conn);
+  if (request_id < 0) {
+    fprintf(stderr, "[batch_server] rpc_read_end failed\n");
+    return -1;
+  }
+
+  // Send response: [num_fat_binaries : uint32_t] followed by handles
+  uint32_t num_handles = (uint32_t)fat_binary_handles.size();
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &num_handles, sizeof(uint32_t)) < 0)
+    return -1;
+
+  for (auto h : fat_binary_handles) {
+    if (rpc_write(conn, &h, sizeof(void **)) < 0)
+      return -1;
+  }
+
+  if (rpc_write_end(conn) < 0)
+    return -1;
+
+  fprintf(stderr, "[batch_server] processed %u commands, %u fat binaries\n",
+          cmd_count, num_handles);
+  return 0;
+}
 
 int handle___cudaRegisterFatBinary(conn_t *conn) {
   __cudaFatCudaBinary2 *fatCubin =

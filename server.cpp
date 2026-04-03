@@ -29,8 +29,11 @@
 #include <signal.h>
 #include <sys/mman.h>
 
+#include "codegen/cuda_batch.h"
 #include "codegen/gen_server.h"
 #include "rpc.h"
+
+extern int handle_batch_cuda_register(conn_t *conn);
 
 #define DEFAULT_PORT 14833
 #define MAX_CLIENTS 10
@@ -250,6 +253,13 @@ void client_handler(int connfd) {
 
   while (1) {
     int op = rpc_dispatch(&conn, 0);
+
+    if (op == RPC_BATCH_CUDA_REGISTER) {
+      if (handle_batch_cuda_register(&conn) < 0) {
+        std::cerr << "Error handling batch register." << std::endl;
+      }
+      continue;
+    }
 
     auto opHandler = get_handler(op);
     if (opHandler(&conn) < 0) {

@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cuda_batch.h"
 #include "gen_api.h"
 #include "ptx_fatbin.hpp"
 #include "rpc.h"
@@ -642,9 +643,56 @@ void parse_ptx_string(void *fatCubin, const char *ptx_string,
   }
 }
 
+// Counter for assigning fake fat binary handles during batch mode
+static uint32_t s_fat_binary_index = 0;
+
 extern "C" void **__cudaRegisterFatBinary(void *fatCubin) {
+  // Always do the local PTX parsing work regardless of batch mode
+  if (*(unsigned *)fatCubin == __cudaFatMAGIC2) {
+    __cudaFatCudaBinary2 *binary = (__cudaFatCudaBinary2 *)fatCubin;
+    __cudaFatCudaBinary2Header *header =
+        (__cudaFatCudaBinary2Header *)binary->text;
+
+    char *base = (char *)(header + 1);
+    long long unsigned int offset = 0;
+
+    while (offset < header->size) {
+      __cudaFatCudaBinary2EntryRec *entry =
+          (__cudaFatCudaBinary2EntryRec *)(base + offset);
+      offset += entry->binary + entry->binarySize;
+
+      if (!(entry->type & FATBIN_2_PTX))
+        continue;
+
+      if (entry->flags & FATBIN_FLAG_COMPRESS) {
+        uint8_t *text_data = NULL;
+        size_t text_data_size = 0;
+
+        std::cout << "decompression required; starting decompress..."
+                  << std::endl;
+
+        if (decompress_single_section((const uint8_t *)entry + entry->binary,
+                                      &text_data, &text_data_size, header,
+                                      entry) < 0) {
+          std::cout << "decompressing failed..." << std::endl;
+          // Fall through; PTX parse skipped but registration continues
+        } else {
+          parse_ptx_string(fatCubin, (char *)text_data, text_data_size);
+        }
+      } else {
+        parse_ptx_string(fatCubin, (char *)entry + entry->binary,
+                         entry->binarySize);
+      }
+    }
+  }
+
+  // FatBinary calls are always sent immediately via RPC (they're few but large).
+  // Only Var/Function/FatBinaryEnd calls are batched (they're 10,000+ tiny calls).
+  // Flush any pending batch first, but keep batching active for subsequent calls.
+  cuda_batch_flush_and_continue();
+  cuda_batch_set_inside_fat_binary(1);
+
   void **p;
-  int return_value;
 
   conn_t *conn = rpc_client_get_connection(0);
 
@@ -659,70 +707,32 @@ extern "C" void **__cudaRegisterFatBinary(void *fatCubin) {
 
     __cudaFatCudaBinary2Header *header =
         (__cudaFatCudaBinary2Header *)binary->text;
-
     unsigned long long size = sizeof(__cudaFatCudaBinary2Header) + header->size;
 
     if (rpc_write(conn, &size, sizeof(unsigned long long)) < 0 ||
         rpc_write(conn, header, size) < 0)
       return nullptr;
-
-    // also parse the ptx file from the fatbin to store the parameter sizes for
-    // the assorted functions
-    char *base = (char *)(header + 1);
-    long long unsigned int offset = 0;
-    __cudaFatCudaBinary2EntryRec *entry =
-        (__cudaFatCudaBinary2EntryRec *)(base);
-
-    while (offset < header->size) {
-      entry = (__cudaFatCudaBinary2EntryRec *)(base + offset);
-      offset += entry->binary + entry->binarySize;
-
-      if (!(entry->type & FATBIN_2_PTX))
-        continue;
-
-      // if compress flag exists, we should decompress before parsing the ptx
-      if (entry->flags & FATBIN_FLAG_COMPRESS) {
-        uint8_t *text_data = NULL;
-        size_t text_data_size = 0;
-
-        std::cout << "decompression required; starting decompress..."
-                  << std::endl;
-
-        if (decompress_single_section((const uint8_t *)entry + entry->binary,
-                                      &text_data, &text_data_size, header,
-                                      entry) < 0) {
-          std::cout << "decompressing failed..." << std::endl;
-          return nullptr;
-        }
-
-        // verify the decompressed output looks right; we should run
-        // --no-compress with nvcc before running this decompression logic to
-        // compare outputs.
-        for (int i = 0; i < text_data_size; i++)
-          std::cout << *(char *)((char *)text_data + i);
-        std::cout << std::endl;
-
-        parse_ptx_string(fatCubin, (char *)text_data, text_data_size);
-      } else {
-        // print the entire ptx file for debugging
-        for (int i = 0; i < entry->binarySize; i++)
-          std::cout << *(char *)((char *)entry + entry->binary + i);
-        std::cout << std::endl;
-
-        parse_ptx_string(fatCubin, (char *)entry + entry->binary,
-                         entry->binarySize);
-      }
-    }
   }
 
   if (rpc_wait_for_response(conn) < 0 ||
-      rpc_read(conn, &p, sizeof(void **)) < 0 || rpc_read_end(conn) < 0)
+      rpc_read(conn, &p, sizeof(void **)) < 0 || rpc_read_end(conn) < 0) {
+    cuda_batch_set_inside_fat_binary(0);
     return nullptr;
+  }
 
+  cuda_batch_set_inside_fat_binary(0);
   return p;
 }
 
 extern "C" void __cudaRegisterFatBinaryEnd(void **fatCubinHandle) {
+  if (cuda_batch_is_active()) {
+    // Serialize the fake handle and append
+    uint8_t buf[sizeof(void **)];
+    memcpy(buf, &fatCubinHandle, sizeof(void **));
+    cuda_batch_append(CUDA_BATCH_FAT_BINARY_END, buf, sizeof(buf));
+    return;
+  }
+
   void *return_value;
 
   conn_t *conn = rpc_client_get_connection(0);
@@ -789,8 +799,6 @@ extern "C" void __cudaRegisterFunction(void **fatCubinHandle,
                                        const char *deviceName, int thread_limit,
                                        uint3 *tid, uint3 *bid, dim3 *bDim,
                                        dim3 *gDim, int *wSize) {
-  void *return_value;
-
   size_t deviceFunLen = strlen(deviceFun) + 1;
   size_t deviceNameLen = strlen(deviceName) + 1;
 
@@ -806,6 +814,50 @@ extern "C" void __cudaRegisterFunction(void **fatCubinHandle,
   if (wSize != nullptr)
     mask |= 1 << 4;
 
+  // Always update local host_func mapping
+  for (auto &function : functions)
+    if (strcmp(function.name, deviceName) == 0)
+      function.host_func = hostFun;
+
+  if (cuda_batch_is_active()) {
+    // Compute serialized size
+    uint32_t buf_size = (uint32_t)(sizeof(void **) +      // fatCubinHandle
+                                   sizeof(void *) +       // hostFun pointer
+                                   sizeof(size_t) +       // deviceFunLen
+                                   deviceFunLen +         // deviceFun
+                                   sizeof(size_t) +       // deviceNameLen
+                                   deviceNameLen +        // deviceName
+                                   sizeof(int) +          // thread_limit
+                                   sizeof(uint8_t) +      // mask
+                                   (tid   ? sizeof(uint3) : 0) +
+                                   (bid   ? sizeof(uint3) : 0) +
+                                   (bDim  ? sizeof(dim3)  : 0) +
+                                   (gDim  ? sizeof(dim3)  : 0) +
+                                   (wSize ? sizeof(int)   : 0));
+
+    uint8_t *buf = (uint8_t *)malloc(buf_size);
+    if (buf) {
+      uint8_t *p = buf;
+      memcpy(p, &fatCubinHandle, sizeof(void **));    p += sizeof(void **);
+      memcpy(p, &hostFun, sizeof(void *));            p += sizeof(void *);
+      memcpy(p, &deviceFunLen, sizeof(size_t));       p += sizeof(size_t);
+      memcpy(p, deviceFun, deviceFunLen);             p += deviceFunLen;
+      memcpy(p, &deviceNameLen, sizeof(size_t));      p += sizeof(size_t);
+      memcpy(p, deviceName, deviceNameLen);           p += deviceNameLen;
+      memcpy(p, &thread_limit, sizeof(int));          p += sizeof(int);
+      memcpy(p, &mask, sizeof(uint8_t));              p += sizeof(uint8_t);
+      if (tid)   { memcpy(p, tid,   sizeof(uint3)); p += sizeof(uint3); }
+      if (bid)   { memcpy(p, bid,   sizeof(uint3)); p += sizeof(uint3); }
+      if (bDim)  { memcpy(p, bDim,  sizeof(dim3));  p += sizeof(dim3);  }
+      if (gDim)  { memcpy(p, gDim,  sizeof(dim3));  p += sizeof(dim3);  }
+      if (wSize) { memcpy(p, wSize, sizeof(int));   p += sizeof(int);   }
+      cuda_batch_append(CUDA_BATCH_FUNCTION, buf, buf_size);
+      free(buf);
+    }
+    return;
+  }
+
+  void *return_value;
   conn_t *conn = rpc_client_get_connection(0);
 
   if (rpc_write_start_request(conn, RPC___cudaRegisterFunction) < 0 ||
@@ -824,17 +876,49 @@ extern "C" void __cudaRegisterFunction(void **fatCubinHandle,
       (wSize != nullptr && rpc_write(conn, wSize, sizeof(int)) < 0) ||
       rpc_wait_for_response(conn) < 0 || rpc_read_end(conn) < 0)
     return;
-
-  // also memorize the host pointer function
-  for (auto &function : functions)
-    if (strcmp(function.name, deviceName) == 0)
-      function.host_func = hostFun;
 }
 
 extern "C" void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
                                   char *deviceAddress, const char *deviceName,
                                   int ext, size_t size, int constant,
                                   int global) {
+  size_t hostVarLen = strlen(hostVar) + 1;
+  size_t deviceAddressLen = strlen(deviceAddress) + 1;
+  size_t deviceNameLen = strlen(deviceName) + 1;
+
+  if (cuda_batch_is_active()) {
+    uint32_t buf_size = (uint32_t)(sizeof(void *) +       // fatCubinHandle
+                                   sizeof(size_t) +       // hostVarLen
+                                   hostVarLen +           // hostVar
+                                   sizeof(size_t) +       // deviceAddressLen
+                                   deviceAddressLen +     // deviceAddress
+                                   sizeof(size_t) +       // deviceNameLen
+                                   deviceNameLen +        // deviceName
+                                   sizeof(int) +          // ext
+                                   sizeof(size_t) +       // size
+                                   sizeof(int) +          // constant
+                                   sizeof(int));          // global
+
+    uint8_t *buf = (uint8_t *)malloc(buf_size);
+    if (buf) {
+      uint8_t *p = buf;
+      memcpy(p, &fatCubinHandle, sizeof(void *));         p += sizeof(void *);
+      memcpy(p, &hostVarLen, sizeof(size_t));             p += sizeof(size_t);
+      memcpy(p, hostVar, hostVarLen);                     p += hostVarLen;
+      memcpy(p, &deviceAddressLen, sizeof(size_t));       p += sizeof(size_t);
+      memcpy(p, deviceAddress, deviceAddressLen);         p += deviceAddressLen;
+      memcpy(p, &deviceNameLen, sizeof(size_t));          p += sizeof(size_t);
+      memcpy(p, deviceName, deviceNameLen);               p += deviceNameLen;
+      memcpy(p, &ext, sizeof(int));                       p += sizeof(int);
+      memcpy(p, &size, sizeof(size_t));                   p += sizeof(size_t);
+      memcpy(p, &constant, sizeof(int));                  p += sizeof(int);
+      memcpy(p, &global, sizeof(int));                    p += sizeof(int);
+      cuda_batch_append(CUDA_BATCH_VAR, buf, buf_size);
+      free(buf);
+    }
+    return;
+  }
+
   void *return_value;
 
   conn_t *conn = rpc_client_get_connection(0);
@@ -850,8 +934,6 @@ extern "C" void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
     return;
   }
 
-  // Send hostVar length and data
-  size_t hostVarLen = strlen(hostVar) + 1;
   if (rpc_write(conn, &hostVarLen, sizeof(size_t)) < 0) {
     std::cerr << "Failed to send hostVar length" << std::endl;
     return;
@@ -861,8 +943,6 @@ extern "C" void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
     return;
   }
 
-  // Send deviceAddress length and data
-  size_t deviceAddressLen = strlen(deviceAddress) + 1;
   if (rpc_write(conn, &deviceAddressLen, sizeof(size_t)) < 0) {
     std::cerr << "Failed to send deviceAddress length" << std::endl;
     return;
@@ -872,8 +952,6 @@ extern "C" void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
     return;
   }
 
-  // Send deviceName length and data
-  size_t deviceNameLen = strlen(deviceName) + 1;
   if (rpc_write(conn, &deviceNameLen, sizeof(size_t)) < 0) {
     std::cerr << "Failed to send deviceName length" << std::endl;
     return;
@@ -883,7 +961,6 @@ extern "C" void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
     return;
   }
 
-  // Write the rest of the arguments
   if (rpc_write(conn, &ext, sizeof(int)) < 0) {
     std::cerr << "Failed writing ext" << std::endl;
     return;
@@ -904,7 +981,6 @@ extern "C" void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
     return;
   }
 
-  // Wait for a response from the server
   if (rpc_wait_for_response(conn) < 0 || rpc_read_end(conn) < 0) {
     std::cerr << "Failed waiting for response" << std::endl;
     return;

@@ -26,6 +26,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 
+#include "codegen/cuda_batch.h"
 #include "codegen/gen_client.h"
 #include "rpc.h"
 
@@ -244,12 +245,16 @@ void *rpc_client_dispatch_thread(void *arg) {
 }
 
 int rpc_open() {
+  // fprintf(stderr, "[SCUDA-DBG] rpc_open: entry\n");
   set_segfault_handlers();
+  // fprintf(stderr, "[SCUDA-DBG] rpc_open: after set_segfault_handlers\n");
 
   sigsetjmp(catch_segfault, 1);
+  // fprintf(stderr, "[SCUDA-DBG] rpc_open: after sigsetjmp\n");
 
   if (pthread_mutex_lock(&conn_mutex) < 0)
     return -1;
+  // fprintf(stderr, "[SCUDA-DBG] rpc_open: after mutex lock\n");
 
   if (nconns > 0) {
     if (pthread_mutex_unlock(&conn_mutex) < 0)
@@ -257,13 +262,14 @@ int rpc_open() {
     return 0;
   }
 
-  std::cout << "Opening connection to server" << std::endl;
+  // fprintf(stderr, "[SCUDA-DBG] rpc_open: getting SCUDA_SERVER env\n");
 
   char *server_ips = getenv("SCUDA_SERVER");
   if (server_ips == NULL) {
-    printf("SCUDA_SERVER environment variable not set\n");
+    fprintf(stderr, "SCUDA_SERVER environment variable not set\n");
     std::exit(1);
   }
+  // fprintf(stderr, "[SCUDA-DBG] rpc_open: server=%s\n", server_ips);
 
   char *server_ip = strdup(server_ips);
   char *token;
@@ -282,51 +288,58 @@ int rpc_open() {
       port = colon + 1;
     }
 
+    // fprintf(stderr, "[SCUDA-DBG] rpc_open: resolving %s:%s\n", host, port);
     addrinfo hints, *res;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host, port, &hints, &res) != 0) {
-      std::cout << "getaddrinfo of " << host << " port " << port << " failed"
-                << std::endl;
+      // fprintf(stderr, "[SCUDA-DBG] getaddrinfo failed for %s:%s\n", host, port);
       continue;
     }
+    // fprintf(stderr, "[SCUDA-DBG] rpc_open: getaddrinfo ok\n");
 
     int flag = 1;
     int sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (sockfd == -1) {
-      printf("socket creation failed...\n");
+      // fprintf(stderr, "[SCUDA-DBG] socket creation failed\n");
       exit(1);
     }
+    // fprintf(stderr, "[SCUDA-DBG] rpc_open: socket fd=%d\n", sockfd);
 
     int opts = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag,
                           sizeof(int));
+    // fprintf(stderr, "[SCUDA-DBG] rpc_open: connecting to %s:%s...\n", host, port);
     if (connect(sockfd, res->ai_addr, res->ai_addrlen) < 0) {
-      std::cerr << "Connecting to " << host << " port " << port
-                << " failed: " << strerror(errno) << std::endl;
+      fprintf(stderr, "SCUDA: connect to %s:%s failed: %s\n", host, port, strerror(errno));
       exit(1);
     }
+    // fprintf(stderr, "[SCUDA-DBG] rpc_open: connected!\n");
 
     conns[nconns] = {sockfd, 0};
     if (pthread_mutex_init(&conns[nconns].read_mutex, NULL) < 0 ||
         pthread_mutex_init(&conns[nconns].write_mutex, NULL) < 0) {
       return -1;
     }
+    // fprintf(stderr, "[SCUDA-DBG] rpc_open: creating dispatch thread\n");
 
     pthread_create(&conns[nconns].read_thread, NULL, rpc_client_dispatch_thread,
                    (void *)&conns[nconns]);
+    // fprintf(stderr, "[SCUDA-DBG] rpc_open: thread created, nconns=%d\n", nconns + 1);
 
     nconns++;
   }
 
   if (pthread_mutex_unlock(&conn_mutex) < 0)
     return -1;
+  // fprintf(stderr, "[SCUDA-DBG] rpc_open: done, nconns=%d\n", nconns);
   if (nconns == 0)
     return -1;
   return 0;
 }
 
 conn_t *rpc_client_get_connection(unsigned int index) {
+  cuda_batch_flush_if_pending();
   if (rpc_open() < 0)
     return nullptr;
   return &conns[index];
@@ -375,13 +388,12 @@ void maybe_free_unified_mem(conn_t *conn, void *ptr) {
 CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
                              cuuint64_t flags,
                              CUdriverProcAddressQueryResult *symbolStatus) {
-  std::cout << "cuGetProcAddress getting symbol: " << symbol << std::endl;
+  // cout removed
 
   auto it = get_function_pointer(symbol);
   if (it != nullptr) {
     *pfn = (void *)(&it);
-    std::cout << "cuGetProcAddress: Mapped symbol '" << symbol
-              << "' to function: " << *pfn << std::endl;
+    // cout removed
     return CUDA_SUCCESS;
   }
 
@@ -391,8 +403,7 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
     return CUDA_SUCCESS;
   }
 
-  std::cout << "cuGetProcAddress: Symbol '" << symbol
-            << "' not found in cudaFunctionMap." << std::endl;
+  // cout removed
 
   // fall back to dlsym
   static void *(*real_dlsym)(void *, const char *) = NULL;
@@ -417,8 +428,52 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
   return CUDA_SUCCESS;
 }
 
+// Stub for nvidia-smi internal version check
+// nvidia-smi calls this to validate NVML library compatibility
+typedef int nvmlReturn_t_stub;
+static unsigned char dummy_export_table[256] = {0};
+extern "C" nvmlReturn_t_stub nvmlInternalGetExportTable(const void **ppExportTable, const void *pExportTableId) {
+  // fprintf(stderr, "[SCUDA-DBG] nvmlInternalGetExportTable called\n");
+  if (ppExportTable)
+    *ppExportTable = dummy_export_table;
+  return 0; // NVML_SUCCESS
+}
+
+#define FAKE_NVML_HANDLE ((void *)0xDEAD0001)
+#define FAKE_CUDA_HANDLE ((void *)0xDEAD0002)
+#define FAKE_CUDART_HANDLE ((void *)0xDEAD0003)
+#define FAKE_CUBLAS_HANDLE ((void *)0xDEAD0004)
+
+void *dlopen(const char *filename, int flags) __THROW {
+  static void *(*real_dlopen)(const char *, int) = NULL;
+  if (!real_dlopen)
+    real_dlopen = (void *(*)(const char *, int))dlvsym(RTLD_NEXT, "dlopen", "GLIBC_2.2.5");
+
+  if (filename) {
+    if (strstr(filename, "libnvidia-ml") || strstr(filename, "nvml"))
+      return FAKE_NVML_HANDLE;
+    if (strstr(filename, "libcuda.so"))
+      return FAKE_CUDA_HANDLE;
+    if (strstr(filename, "libcudart"))
+      return FAKE_CUDART_HANDLE;
+    if (strstr(filename, "libcublas"))
+      return FAKE_CUBLAS_HANDLE;
+  }
+  return real_dlopen(filename, flags);
+}
+
+int dlclose(void *handle) __THROW {
+  if (handle == FAKE_NVML_HANDLE || handle == FAKE_CUDA_HANDLE ||
+      handle == FAKE_CUDART_HANDLE || handle == FAKE_CUBLAS_HANDLE)
+    return 0;
+  static int (*real_dlclose)(void *) = NULL;
+  if (!real_dlclose)
+    real_dlclose = (int (*)(void *))dlvsym(RTLD_NEXT, "dlclose", "GLIBC_2.2.5");
+  return real_dlclose(handle);
+}
+
 void *dlsym(void *handle, const char *name) __THROW {
-  std::cout << "dlsym: " << name << std::endl;
+  // fprintf(stderr, "[SCUDA-DBG] dlsym: %s\n", name);
 
   void *func = get_function_pointer(name);
 
@@ -430,9 +485,19 @@ void *dlsym(void *handle, const char *name) __THROW {
   }
 
   if (func != nullptr) {
-    // std::cout << "[dlsym] Function address from cudaFunctionMap: " << func
-    // << " " << name << std::endl;
     return func;
+  }
+
+  // Handle internal NVIDIA functions not in the proxy
+  if (strcmp(name, "nvmlInternalGetExportTable") == 0) {
+    return (void *)&nvmlInternalGetExportTable;
+  }
+
+  // For fake handles, we can't call real_dlsym - return NULL for unknown funcs
+  if (handle == FAKE_NVML_HANDLE || handle == FAKE_CUDA_HANDLE ||
+      handle == FAKE_CUDART_HANDLE || handle == FAKE_CUBLAS_HANDLE) {
+    // fprintf(stderr, "[SCUDA-DBG] dlsym: unknown func '%s' on fake handle\n", name);
+    return NULL;
   }
 
   // Real dlsym lookup
@@ -442,7 +507,5 @@ void *dlsym(void *handle, const char *name) __THROW {
                                                          "GLIBC_2.2.5");
   }
 
-  // std::cout << "[dlsym] Falling back to real_dlsym for name: " << name <<
-  // std::endl;
   return real_dlsym(handle, name);
 }

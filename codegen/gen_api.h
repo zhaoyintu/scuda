@@ -1370,3 +1370,6 @@
 #define RPC_cudnnGetNormalizationForwardTrainingWorkspaceSize 1369
 #define RPC_cudnnGetNormalizationBackwardWorkspaceSize 1370
 #define RPC_cudnnGetNormalizationTrainingReserveSpaceSize 1371
+
+// Batch registration opcode
+#define RPC_BATCH_CUDA_REGISTER 8000

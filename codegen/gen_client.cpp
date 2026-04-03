@@ -52980,7 +52980,8 @@ cudnnStatus_t cudnnGetNormalizationTrainingReserveSpaceSize(
   return return_value;
 }
 
-std::unordered_map<std::string, void *> functionMap = {
+static std::unordered_map<std::string, void *> &get_functionMap() {
+  static std::unordered_map<std::string, void *> m = {
     {"__cudaRegisterVar", (void *)__cudaRegisterVar},
     {"__cudaRegisterFunction", (void *)__cudaRegisterFunction},
     {"__cudaRegisterFatBinary", (void *)__cudaRegisterFatBinary},
@@ -53795,7 +53796,7 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cudaStreamGetCaptureInfo_v2", (void *)cudaStreamGetCaptureInfo_v2},
     {"cudaStreamUpdateCaptureDependencies",
      (void *)cudaStreamUpdateCaptureDependencies},
-    {"cudaEventCreate", (void *)cudaEventCreate},
+    {"cudaEventCreate", (void *)(cudaError_t(*)(cudaEvent_t *))cudaEventCreate},
     {"cudaEventCreateWithFlags", (void *)cudaEventCreateWithFlags},
     {"cudaEventRecord", (void *)cudaEventRecord},
     {"cudaEventRecordWithFlags", (void *)cudaEventRecordWithFlags},
@@ -53815,7 +53816,7 @@ std::unordered_map<std::string, void *> functionMap = {
      (void *)cudaWaitExternalSemaphoresAsync_v2},
     {"cudaDestroyExternalSemaphore", (void *)cudaDestroyExternalSemaphore},
     {"cudaLaunchKernelExC", (void *)cudaLaunchKernelExC},
-    {"cudaLaunchCooperativeKernel", (void *)cudaLaunchCooperativeKernel},
+    {"cudaLaunchCooperativeKernel", (void *)(cudaError_t(*)(const void *, dim3, dim3, void **, size_t, cudaStream_t))cudaLaunchCooperativeKernel},
     {"cudaLaunchCooperativeKernelMultiDevice",
      (void *)cudaLaunchCooperativeKernelMultiDevice},
     {"cudaFuncSetCacheConfig", (void *)cudaFuncSetCacheConfig},
@@ -53825,21 +53826,21 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cudaSetDoubleForDevice", (void *)cudaSetDoubleForDevice},
     {"cudaSetDoubleForHost", (void *)cudaSetDoubleForHost},
     {"cudaOccupancyMaxActiveBlocksPerMultiprocessor",
-     (void *)cudaOccupancyMaxActiveBlocksPerMultiprocessor},
+     (void *)(cudaError_t(*)(int *, const void *, int, size_t))cudaOccupancyMaxActiveBlocksPerMultiprocessor},
     {"cudaOccupancyAvailableDynamicSMemPerBlock",
-     (void *)cudaOccupancyAvailableDynamicSMemPerBlock},
+     (void *)(cudaError_t(*)(size_t *, const void *, int, int))cudaOccupancyAvailableDynamicSMemPerBlock},
     {"cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags",
-     (void *)cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags},
+     (void *)(cudaError_t(*)(int *, const void *, int, size_t, unsigned int))cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags},
     {"cudaOccupancyMaxPotentialClusterSize",
-     (void *)cudaOccupancyMaxPotentialClusterSize},
-    {"cudaOccupancyMaxActiveClusters", (void *)cudaOccupancyMaxActiveClusters},
-    {"cudaMalloc", (void *)cudaMalloc},
-    {"cudaMallocPitch", (void *)cudaMallocPitch},
+     (void *)(cudaError_t(*)(int *, const void *, const cudaLaunchConfig_t *))cudaOccupancyMaxPotentialClusterSize},
+    {"cudaOccupancyMaxActiveClusters", (void *)(cudaError_t(*)(int *, const void *, const cudaLaunchConfig_t *))cudaOccupancyMaxActiveClusters},
+    {"cudaMalloc", (void *)(cudaError_t(*)(void **, size_t))cudaMalloc},
+    {"cudaMallocPitch", (void *)(cudaError_t(*)(void **, size_t *, size_t, size_t))cudaMallocPitch},
     {"cudaMallocArray", (void *)cudaMallocArray},
     {"cudaFreeHost", (void *)cudaFreeHost},
     {"cudaFreeArray", (void *)cudaFreeArray},
     {"cudaFreeMipmappedArray", (void *)cudaFreeMipmappedArray},
-    {"cudaHostAlloc", (void *)cudaHostAlloc},
+    {"cudaHostAlloc", (void *)(cudaError_t(*)(void **, size_t, unsigned int))cudaHostAlloc},
     {"cudaMalloc3D", (void *)cudaMalloc3D},
     {"cudaMalloc3DArray", (void *)cudaMalloc3DArray},
     {"cudaMallocMipmappedArray", (void *)cudaMallocMipmappedArray},
@@ -53870,19 +53871,19 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cudaMemset3DAsync", (void *)cudaMemset3DAsync},
     {"cudaGetSymbolAddress", (void *)cudaGetSymbolAddress},
     {"cudaGetSymbolSize", (void *)cudaGetSymbolSize},
-    {"cudaMemPrefetchAsync", (void *)cudaMemPrefetchAsync},
-    {"cudaMemAdvise", (void *)cudaMemAdvise},
+    {"cudaMemPrefetchAsync", (void *)(cudaError_t(*)(const void *, size_t, int, cudaStream_t))cudaMemPrefetchAsync},
+    {"cudaMemAdvise", (void *)(cudaError_t(*)(const void *, size_t, enum cudaMemoryAdvise, int))cudaMemAdvise},
     {"cudaMemRangeGetAttributes", (void *)cudaMemRangeGetAttributes},
     {"cudaMemcpyToArray", (void *)cudaMemcpyToArray},
     {"cudaMemcpyArrayToArray", (void *)cudaMemcpyArrayToArray},
     {"cudaMemcpyToArrayAsync", (void *)cudaMemcpyToArrayAsync},
-    {"cudaMallocAsync", (void *)cudaMallocAsync},
+    {"cudaMallocAsync", (void *)(cudaError_t(*)(void **, size_t, cudaStream_t))cudaMallocAsync},
     {"cudaMemPoolTrimTo", (void *)cudaMemPoolTrimTo},
     {"cudaMemPoolSetAccess", (void *)cudaMemPoolSetAccess},
     {"cudaMemPoolGetAccess", (void *)cudaMemPoolGetAccess},
     {"cudaMemPoolCreate", (void *)cudaMemPoolCreate},
     {"cudaMemPoolDestroy", (void *)cudaMemPoolDestroy},
-    {"cudaMallocFromPoolAsync", (void *)cudaMallocFromPoolAsync},
+    {"cudaMallocFromPoolAsync", (void *)(cudaError_t(*)(void **, size_t, cudaMemPool_t, cudaStream_t))cudaMallocFromPoolAsync},
     {"cudaMemPoolImportPointer", (void *)cudaMemPoolImportPointer},
     {"cudaPointerGetAttributes", (void *)cudaPointerGetAttributes},
     {"cudaDeviceCanAccessPeer", (void *)cudaDeviceCanAccessPeer},
@@ -53969,7 +53970,7 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cudaGraphAddDependencies", (void *)cudaGraphAddDependencies},
     {"cudaGraphRemoveDependencies", (void *)cudaGraphRemoveDependencies},
     {"cudaGraphDestroyNode", (void *)cudaGraphDestroyNode},
-    {"cudaGraphInstantiate", (void *)cudaGraphInstantiate},
+    {"cudaGraphInstantiate", (void *)(cudaError_t(*)(cudaGraphExec_t *, cudaGraph_t, unsigned long long))cudaGraphInstantiate},
     {"cudaGraphInstantiateWithFlags", (void *)cudaGraphInstantiateWithFlags},
     {"cudaGraphInstantiateWithParams", (void *)cudaGraphInstantiateWithParams},
     {"cudaGraphExecGetFlags", (void *)cudaGraphExecGetFlags},
@@ -54539,10 +54540,10 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuMemAllocFromPoolAsync_ptsz", (void *)cuMemAllocFromPoolAsync},
     {"cudaFree", (void *)cudaFree},
     {"cudaMemcpy", (void *)cudaMemcpy},
-    {"cudaMallocHost", (void *)cudaMallocHost},
+    {"cudaMallocHost", (void *)(cudaError_t(*)(void **, size_t))cudaMallocHost},
     {"cudaMemcpyAsync", (void *)cudaMemcpyAsync},
-    {"cudaLaunchKernel", (void *)cudaLaunchKernel},
-    {"cudaMallocManaged", (void *)cudaMallocManaged},
+    {"cudaLaunchKernel", (void *)(cudaError_t(*)(const void *, dim3, dim3, void **, size_t, cudaStream_t))cudaLaunchKernel},
+    {"cudaMallocManaged", (void *)(cudaError_t(*)(void **, size_t, unsigned int))cudaMallocManaged},
     {"cudaGraphGetNodes", (void *)cudaGraphGetNodes},
     {"cudaGraphDestroy", (void *)cudaGraphDestroy},
     {"cudaGraphAddKernelNode", (void *)cudaGraphAddKernelNode},
@@ -54552,8 +54553,11 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cudaGraphAddMemAllocNode", (void *)cudaGraphAddMemAllocNode},
     {"cudaDeviceGetGraphMemAttribute", (void *)cudaDeviceGetGraphMemAttribute},
 };
+  return m;
+}
 
 void *get_function_pointer(const char *name) {
+  auto &functionMap = get_functionMap();
   auto it = functionMap.find(name);
   if (it == functionMap.end())
     return nullptr;

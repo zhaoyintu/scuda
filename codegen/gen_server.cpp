@@ -27,6 +27,20 @@
 
 #include "rpc.h"
 
+// Stubs for cuDNN v9 functions not available in cuDNN v8
+#ifndef cudnnGraphVersionCheck
+#define cudnnGraphVersionCheck() ((cudnnStatus_t)CUDNN_STATUS_NOT_SUPPORTED)
+#endif
+#ifndef cudnnOpsVersionCheck
+#define cudnnOpsVersionCheck() ((cudnnStatus_t)CUDNN_STATUS_NOT_SUPPORTED)
+#endif
+#ifndef cudnnBackendPopulateCudaGraph
+#define cudnnBackendPopulateCudaGraph(a,b,c,d) ((cudnnStatus_t)CUDNN_STATUS_NOT_SUPPORTED)
+#endif
+#ifndef cudnnBackendUpdateCudaGraph
+#define cudnnBackendUpdateCudaGraph(a,b,c,d) ((cudnnStatus_t)CUDNN_STATUS_NOT_SUPPORTED)
+#endif
+
 int handle_nvmlInit_v2(conn_t *conn) {
   int request_id;
   nvmlReturn_t scuda_intercept_result;
