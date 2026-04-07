@@ -4,6 +4,9 @@
 #include <pthread.h>
 #include <sys/uio.h>
 
+// Async RPC: set high bit of opcode to indicate fire-and-forget (no response)
+#define RPC_ASYNC_BIT (1u << 31)
+
 typedef struct {
   int connfd;
 
@@ -11,6 +14,9 @@ typedef struct {
   int read_id;
   int write_id;
   int write_op;
+
+  // When set, rpc_write_end skips writev (server suppresses response)
+  int suppress_response;
 
   pthread_t read_thread;
   pthread_t rpc_thread;

@@ -156,6 +156,13 @@ int rpc_write(conn_t *conn, const void *data, const size_t size) {
 // the request lock is released after the request is sent and the function
 // returns the request id which can be used to wait for a response.
 int rpc_write_end(conn_t *conn) {
+  // When suppress_response is set (server-side, async RPC), skip sending response
+  if (conn->suppress_response) {
+    conn->suppress_response = 0;
+    pthread_mutex_unlock(&conn->write_mutex);
+    return conn->write_id;
+  }
+
   conn->write_iov[0] = {&conn->write_id, sizeof(int)};
   if (conn->write_op != -1) {
     conn->write_iov[1] = {&conn->write_op, sizeof(unsigned int)};

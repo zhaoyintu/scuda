@@ -30,10 +30,12 @@
 #include <sys/mman.h>
 
 #include "codegen/cuda_batch.h"
+#include "codegen/gen_api.h"
 #include "codegen/gen_server.h"
 #include "rpc.h"
 
 extern int handle_batch_cuda_register(conn_t *conn);
+extern int handle_cache_fatbinary_hit(conn_t *conn);
 
 #define DEFAULT_PORT 14833
 #define MAX_CLIENTS 10
@@ -252,11 +254,29 @@ void client_handler(int connfd) {
   printf("Client connected.\n");
 
   while (1) {
-    int op = rpc_dispatch(&conn, 0);
+    int op_raw = rpc_dispatch(&conn, 0);
+    unsigned int op = (unsigned int)op_raw;
+
+    // Check for async bit: client doesn't expect a response
+    if (op & RPC_ASYNC_BIT) {
+      op &= ~RPC_ASYNC_BIT;  // mask off the async bit
+      conn.suppress_response = 1;  // handler will skip sending response
+    } else {
+      conn.suppress_response = 0;
+    }
 
     if (op == RPC_BATCH_CUDA_REGISTER) {
+      conn.suppress_response = 0;  // batch register always responds
       if (handle_batch_cuda_register(&conn) < 0) {
         std::cerr << "Error handling batch register." << std::endl;
+      }
+      continue;
+    }
+
+    if (op == RPC_CACHE_FATBINARY_HIT) {
+      conn.suppress_response = 0;  // cache hit always responds
+      if (handle_cache_fatbinary_hit(&conn) < 0) {
+        std::cerr << "Error handling cache fatbinary hit." << std::endl;
       }
       continue;
     }
