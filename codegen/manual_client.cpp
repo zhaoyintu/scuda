@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "cuda_batch.h"
+#include "fatbin_cache.h"
 #include "gen_api.h"
 #include "ptx_fatbin.hpp"
 #include "rpc.h"
@@ -163,6 +164,13 @@ struct Function {
 };
 
 std::vector<Function> functions;
+
+// FatBinary cache state
+static bool s_fatbin_cache_initialized = false;
+static bool s_fatbin_cache_hit = false;
+static fatbin_hash_t s_current_fatbin_hash = {0, 0};
+static bool s_recording_for_cache = false;
+static size_t s_functions_before_fatbin = 0;
 
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count,
                        enum cudaMemcpyKind kind) {
@@ -647,7 +655,86 @@ void parse_ptx_string(void *fatCubin, const char *ptx_string,
 static uint32_t s_fat_binary_index = 0;
 
 extern "C" void **__cudaRegisterFatBinary(void *fatCubin) {
+  if (!s_fatbin_cache_initialized) {
+    fatbin_cache_init();
+    s_fatbin_cache_initialized = true;
+  }
+  s_fatbin_cache_hit = false;
+  s_recording_for_cache = false;
+
+  // -------------------------------------------------------------------------
+  // Cache check: if this fatbin has been registered before, the server already
+  // holds the real CUDA handle and the client disk cache has the Function list.
+  // -------------------------------------------------------------------------
+  if (*(unsigned *)fatCubin == __cudaFatMAGIC2) {
+    __cudaFatCudaBinary2 *binary = (__cudaFatCudaBinary2 *)fatCubin;
+    __cudaFatCudaBinary2Header *header =
+        (__cudaFatCudaBinary2Header *)binary->text;
+    unsigned long long hdr_size =
+        sizeof(__cudaFatCudaBinary2Header) + header->size;
+
+    s_current_fatbin_hash = fatbin_compute_hash(header, hdr_size);
+
+    // Flush any pending batch but keep batching active
+    cuda_batch_flush_and_continue();
+    cuda_batch_set_inside_fat_binary(1);
+
+    conn_t *conn = rpc_client_get_connection(0);
+
+    if (rpc_write_start_request(conn, RPC_CACHE_FATBINARY_HIT) >= 0 &&
+        rpc_write(conn, &s_current_fatbin_hash.h1, sizeof(uint64_t)) >= 0 &&
+        rpc_write(conn, &s_current_fatbin_hash.h2, sizeof(uint64_t)) >= 0 &&
+        rpc_wait_for_response(conn) >= 0) {
+
+      int32_t status = -1;
+      void **handle = nullptr;
+      if (rpc_read(conn, &status, sizeof(int32_t)) >= 0 &&
+          rpc_read(conn, &handle, sizeof(void **)) >= 0 &&
+          rpc_read_end(conn) >= 0 && status == 0) {
+
+        // Cache hit: load Function entries from disk and populate functions vector
+        std::vector<CachedFunction> cached_funcs;
+        if (fatbin_cache_load(s_current_fatbin_hash, cached_funcs)) {
+          for (auto &cf : cached_funcs) {
+            char *name = new char[MAX_FUNCTION_NAME];
+            int *arg_sizes = new int[MAX_ARGS];
+            strncpy(name, cf.name.c_str(), MAX_FUNCTION_NAME - 1);
+            name[MAX_FUNCTION_NAME - 1] = '\0';
+            int arg_count = static_cast<int>(cf.arg_sizes.size());
+            if (arg_count > MAX_ARGS) arg_count = MAX_ARGS;
+            for (int j = 0; j < arg_count; j++)
+              arg_sizes[j] = cf.arg_sizes[j];
+            functions.push_back(Function{
+                .name = name,
+                .fat_cubin = fatCubin,
+                .host_func = nullptr,
+                .arg_sizes = arg_sizes,
+                .arg_count = arg_count,
+            });
+          }
+          s_fatbin_cache_hit = true;
+          cuda_batch_set_inside_fat_binary(0);
+          return handle;
+        }
+        // Disk cache missing even though server hit — fall through to full send
+        // (the server will get a duplicate store, which is idempotent)
+      } else {
+        // Consume any partial response that was buffered
+        (void)rpc_read_end(conn);
+      }
+    }
+
+    cuda_batch_set_inside_fat_binary(0);
+    // Cache miss — fall through to full registration below
+  }
+
+  // -------------------------------------------------------------------------
+  // Full registration path (cache miss or non-MAGIC2 fatbin)
+  // -------------------------------------------------------------------------
+
   // Always do the local PTX parsing work regardless of batch mode
+  s_functions_before_fatbin = functions.size();
+
   if (*(unsigned *)fatCubin == __cudaFatMAGIC2) {
     __cudaFatCudaBinary2 *binary = (__cudaFatCudaBinary2 *)fatCubin;
     __cudaFatCudaBinary2Header *header =
@@ -721,16 +808,54 @@ extern "C" void **__cudaRegisterFatBinary(void *fatCubin) {
   }
 
   cuda_batch_set_inside_fat_binary(0);
+
+  // Mark that we should record function entries for saving to disk cache
+  s_recording_for_cache = true;
+
   return p;
 }
 
 extern "C" void __cudaRegisterFatBinaryEnd(void **fatCubinHandle) {
+  // Cache hit: server already knows about this fatbin; skip the RPC entirely.
+  if (s_fatbin_cache_hit) {
+    s_fatbin_cache_hit = false;
+    return;
+  }
+
   if (cuda_batch_is_active()) {
     // Serialize the fake handle and append
     uint8_t buf[sizeof(void **)];
     memcpy(buf, &fatCubinHandle, sizeof(void **));
     cuda_batch_append(CUDA_BATCH_FAT_BINARY_END, buf, sizeof(buf));
+
+    // If we were recording for cache, save the new Function entries now.
+    if (s_recording_for_cache) {
+      std::vector<CachedFunction> new_funcs;
+      for (size_t i = s_functions_before_fatbin; i < functions.size(); i++) {
+        CachedFunction cf;
+        cf.name = functions[i].name;
+        for (int j = 0; j < functions[i].arg_count; j++)
+          cf.arg_sizes.push_back(functions[i].arg_sizes[j]);
+        new_funcs.push_back(std::move(cf));
+      }
+      fatbin_cache_save(s_current_fatbin_hash, new_funcs);
+      s_recording_for_cache = false;
+    }
     return;
+  }
+
+  // Non-batch path — same save logic applies.
+  if (s_recording_for_cache) {
+    std::vector<CachedFunction> new_funcs;
+    for (size_t i = s_functions_before_fatbin; i < functions.size(); i++) {
+      CachedFunction cf;
+      cf.name = functions[i].name;
+      for (int j = 0; j < functions[i].arg_count; j++)
+        cf.arg_sizes.push_back(functions[i].arg_sizes[j]);
+      new_funcs.push_back(std::move(cf));
+    }
+    fatbin_cache_save(s_current_fatbin_hash, new_funcs);
+    s_recording_for_cache = false;
   }
 
   void *return_value;
@@ -819,6 +944,11 @@ extern "C" void __cudaRegisterFunction(void **fatCubinHandle,
     if (strcmp(function.name, deviceName) == 0)
       function.host_func = hostFun;
 
+  // Cache hit: server already has this function registered; only the local
+  // host_func update above is needed.
+  if (s_fatbin_cache_hit)
+    return;
+
   if (cuda_batch_is_active()) {
     // Compute serialized size
     uint32_t buf_size = (uint32_t)(sizeof(void **) +      // fatCubinHandle
@@ -882,6 +1012,10 @@ extern "C" void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
                                   char *deviceAddress, const char *deviceName,
                                   int ext, size_t size, int constant,
                                   int global) {
+  // Cache hit: server already has this variable registered.
+  if (s_fatbin_cache_hit)
+    return;
+
   size_t hostVarLen = strlen(hostVar) + 1;
   size_t deviceAddressLen = strlen(deviceAddress) + 1;
   size_t deviceNameLen = strlen(deviceName) + 1;

@@ -1373,3 +1373,7 @@
 
 // Batch registration opcode
 #define RPC_BATCH_CUDA_REGISTER 8000
+
+// FatBinary cache opcodes
+#define RPC_CACHE_FATBINARY_HIT   8001
+#define RPC_CACHE_FATBINARY_STORE 8002

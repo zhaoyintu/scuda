@@ -4,8 +4,8 @@ CUDA_HEADERS ?= /tmp/cuda_headers
 CUDA_HOME ?= /usr/local/cuda
 
 # Source files
-CLIENT_SRCS = client.cpp codegen/gen_client.cpp codegen/manual_client.cpp codegen/cuda_batch.cpp rpc.cpp
-SERVER_SRCS = server.cpp codegen/gen_server.cpp codegen/manual_server.cpp rpc.cpp
+CLIENT_SRCS = client.cpp codegen/gen_client.cpp codegen/manual_client.cpp codegen/cuda_batch.cpp codegen/fatbin_cache.cpp rpc.cpp
+SERVER_SRCS = server.cpp codegen/gen_server.cpp codegen/manual_server.cpp codegen/fatbin_cache.cpp rpc.cpp
 
 # Default target
 .PHONY: all local server clean deploy

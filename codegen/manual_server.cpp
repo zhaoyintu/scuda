@@ -14,6 +14,7 @@
 #include <unordered_map>
 
 #include "cuda_batch.h"
+#include "fatbin_cache.h"
 #include "gen_api.h"
 
 #include "gen_server.h"
@@ -24,6 +25,10 @@ extern int rpc_read_end(const conn_t *conn);
 extern int rpc_write_start_response(const conn_t *conn, const int request_id);
 extern int rpc_write(const conn_t *conn, const void *data,
                      const std::size_t size);
+
+// Server-side in-memory fatbinary cache: hash -> real CUDA handle
+static std::unordered_map<fatbin_hash_t, void**, fatbin_hash_hasher>
+    server_fatbin_cache;
 
 void invoke_host_func(void *data);
 void append_managed_ptr(const void *conn, void *srcPtr, void *dstPtr,
@@ -610,6 +615,40 @@ int handle_batch_cuda_register(conn_t *conn) {
   return 0;
 }
 
+// Handle RPC_CACHE_FATBINARY_HIT: client queries whether server already has
+// this fatbin registered (by hash).  Responds with status=0 + handle on hit,
+// or status=-1 + nullptr on miss.
+int handle_cache_fatbinary_hit(conn_t *conn) {
+  fatbin_hash_t hash;
+  if (rpc_read(conn, &hash.h1, sizeof(uint64_t)) < 0 ||
+      rpc_read(conn, &hash.h2, sizeof(uint64_t)) < 0)
+    return -1;
+
+  int request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    return -1;
+
+  auto it = server_fatbin_cache.find(hash);
+  if (it != server_fatbin_cache.end()) {
+    int32_t status = 0;
+    void **handle = it->second;
+    if (rpc_write_start_response(conn, request_id) < 0 ||
+        rpc_write(conn, &status, sizeof(int32_t)) < 0 ||
+        rpc_write(conn, &handle, sizeof(void **)) < 0 ||
+        rpc_write_end(conn) < 0)
+      return -1;
+  } else {
+    int32_t status = -1;
+    void *null_handle = nullptr;
+    if (rpc_write_start_response(conn, request_id) < 0 ||
+        rpc_write(conn, &status, sizeof(int32_t)) < 0 ||
+        rpc_write(conn, &null_handle, sizeof(void *)) < 0 ||
+        rpc_write_end(conn) < 0)
+      return -1;
+  }
+  return 0;
+}
+
 int handle___cudaRegisterFatBinary(conn_t *conn) {
   __cudaFatCudaBinary2 *fatCubin =
       (__cudaFatCudaBinary2 *)malloc(sizeof(__cudaFatCudaBinary2));
@@ -632,6 +671,11 @@ int handle___cudaRegisterFatBinary(conn_t *conn) {
   void **p = __cudaRegisterFatBinary(fatCubin);
 
   fat_binary_map[p] = fatCubin;
+
+  // Store hash -> handle in the server-side cache so cache-hit RPCs can
+  // return the real handle without re-sending the full fatbin data.
+  fatbin_hash_t hash = fatbin_compute_hash(cubin, size);
+  server_fatbin_cache[hash] = p;
 
   if (rpc_write_start_response(conn, request_id) < 0 ||
       rpc_write(conn, &p, sizeof(void **)) < 0 || rpc_write_end(conn) < 0)
