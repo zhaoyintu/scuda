@@ -816,10 +816,11 @@ extern "C" void **__cudaRegisterFatBinary(void *fatCubin) {
 }
 
 extern "C" void __cudaRegisterFatBinaryEnd(void **fatCubinHandle) {
-  // Cache hit: server already knows about this fatbin; skip the RPC entirely.
+  // Cache hit: reset the flag but still send FatBinaryEnd to the server
+  // (the server needs it to complete the registration for this connection).
+  // s_recording_for_cache is already false on cache hit, so no duplicate save.
   if (s_fatbin_cache_hit) {
     s_fatbin_cache_hit = false;
-    return;
   }
 
   if (cuda_batch_is_active()) {
@@ -944,10 +945,9 @@ extern "C" void __cudaRegisterFunction(void **fatCubinHandle,
     if (strcmp(function.name, deviceName) == 0)
       function.host_func = hostFun;
 
-  // Cache hit: server already has this function registered; only the local
-  // host_func update above is needed.
-  if (s_fatbin_cache_hit)
-    return;
+  // Cache hit: server still needs function registration for the new connection's
+  // CUDA context. We skip only the FatBinary data transfer, not the function
+  // registrations. Fall through to batch/RPC path.
 
   if (cuda_batch_is_active()) {
     // Compute serialized size
@@ -1012,9 +1012,8 @@ extern "C" void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
                                   char *deviceAddress, const char *deviceName,
                                   int ext, size_t size, int constant,
                                   int global) {
-  // Cache hit: server already has this variable registered.
-  if (s_fatbin_cache_hit)
-    return;
+  // Cache hit: server still needs var registration for the new connection's
+  // CUDA context. Fall through to batch/RPC path.
 
   size_t hostVarLen = strlen(hostVar) + 1;
   size_t deviceAddressLen = strlen(deviceAddress) + 1;
